@@ -12,6 +12,7 @@ import json
 import uuid
 import asyncio
 import logging
+import random
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -118,6 +119,7 @@ class AgentAction(BaseModel):
     content: str
     sentiment: str  # positive / negative / neutral
     influence_score: float
+    key_signals: List[str] = []
 
 
 class PredictResponse(BaseModel):
@@ -198,7 +200,6 @@ async def run_swarm_simulation(
             "agent_name": f"Agent_{i+1:04d}",
             "agent_role": role,
             "archetype": AGENT_ARCHETYPES[role],
-            "influence_score": round(0.2 + (i % 10) * 0.08, 2),
         })
     
     # ── Phase 2: Run simulation rounds ───────────────────────────────────────
@@ -212,15 +213,13 @@ async def run_swarm_simulation(
     
     # Sample a diverse set of agents for simulation
     sample_size = min(num_agents, 60)
-    import random
-    random.seed(hash(seed_text) % 2**32)
     sampled_agents = random.sample(agents, sample_size)
     
     # Batch agents and run simulation
     batches = [sampled_agents[i:i+BATCH_SIZE] for i in range(0, len(sampled_agents), BATCH_SIZE)]
     
     simulation_tasks = []
-    for batch_idx, batch in enumerate(batches[:2]):  # limit to 3 batches for speed
+    for batch_idx, batch in enumerate(batches):
         task = _simulate_agent_batch(
             seed_text=seed_text,
             agents=batch,
@@ -238,6 +237,22 @@ async def run_swarm_simulation(
             continue
         all_actions.extend(result.get("actions", []))
         round_summaries.extend(result.get("round_summaries", []))
+    
+    # ── Phase 2.5: Compute interaction-based influence scores ────────────────
+    # Count how many REPLY/AMPLIFY actions target each agent_id
+    interaction_counts: Dict[int, int] = {}
+    for action in all_actions:
+        if action.get("action_type") in ("REPLY", "AMPLIFY"):
+            aid = action.get("agent_id", 0)
+            interaction_counts[aid] = interaction_counts.get(aid, 0) + 1
+    
+    max_interactions = max(interaction_counts.values()) if interaction_counts else 1
+    
+    for action in all_actions:
+        aid = action.get("agent_id", 0)
+        llm_score = float(action.get("influence_score", 0.5))
+        interaction_score = min(1.0, interaction_counts.get(aid, 0) / max_interactions)
+        action["influence_score"] = round(0.4 * llm_score + 0.6 * interaction_score, 2)
     
     # ── Phase 3: Generate prediction report ──────────────────────────────────
     report = await _generate_prediction_report(
@@ -258,6 +273,9 @@ async def run_swarm_simulation(
     completed_at = datetime.utcnow()
     duration = (completed_at - started_at).total_seconds()
     
+    # Return top 20 actions by influence_score
+    top_actions = sorted(all_actions, key=lambda a: a.get("influence_score", 0), reverse=True)[:20]
+    
     return {
         "started_at": started_at.isoformat() + "Z",
         "completed_at": completed_at.isoformat() + "Z",
@@ -267,7 +285,7 @@ async def run_swarm_simulation(
         "top_narratives": report.get("top_narratives", []),
         "emerging_trends": report.get("emerging_trends", []),
         "report": report.get("report_text", ""),
-        "sample_actions": all_actions[:20],  # return first 20 for inspection
+        "sample_actions": top_actions,
     }
 
 
@@ -319,10 +337,17 @@ Return ONLY valid JSON array, no markdown."""
             messages=[{"role": "user", "content": prompt}],
             temperature=0.8,
             max_tokens=4096,
-            response_format={"type": "json_object"} if "gpt" in LLM_MODEL else None,
+            timeout=60.0,
         )
         
         content = response.choices[0].message.content.strip()
+        
+        # Strip markdown fences if present
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.strip()
         
         # Parse JSON - handle both array and object wrappers
         if content.startswith("["):
@@ -434,6 +459,7 @@ Return ONLY valid JSON."""
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5,
             max_tokens=2000,
+            timeout=60.0,
         )
         
         content = response.choices[0].message.content.strip()
@@ -456,12 +482,18 @@ Return ONLY valid JSON."""
         }
 
 
-# ─── LLM Client Factory ───────────────────────────────────────────────────────
+# ─── LLM Client Singleton ─────────────────────────────────────────────────────
+
+_llm_client: Optional[AsyncOpenAI] = None
+
 
 def get_llm_client() -> AsyncOpenAI:
-    if not LLM_API_KEY:
-        raise HTTPException(status_code=500, detail="LLM_API_KEY not configured")
-    return AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    global _llm_client
+    if _llm_client is None:
+        if not LLM_API_KEY:
+            raise HTTPException(status_code=500, detail="LLM_API_KEY not configured")
+        _llm_client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    return _llm_client
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
