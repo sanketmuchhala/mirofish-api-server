@@ -13,11 +13,11 @@ import uuid
 import asyncio
 import logging
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
@@ -34,14 +34,16 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL_NAME", "gpt-4o-mini")
 PRICE_PER_CALL_USD = 0.50
 
+# ─── Job State ────────────────────────────────────────────────────────────────
+
+MAX_CONCURRENT_JOBS = 50
+JOBS: Dict[str, Dict[str, Any]] = {}
+
 # ─── x402 Payment Middleware ──────────────────────────────────────────────────
 
 X402_PRICE_USD = PRICE_PER_CALL_USD
 X402_NETWORK = "base"
 X402_CURRENCY = "USDC"
-
-PAID_ROUTES = {"/api/predict"}
-
 
 async def x402_middleware(request: Request, call_next):
     """
@@ -51,10 +53,10 @@ async def x402_middleware(request: Request, call_next):
     """
     path = request.url.path
 
-    if path not in PAID_ROUTES:
+    if not path.startswith("/api/predict"):
         return await call_next(request)
 
-    payment_header = request.headers.get("x-payment") or request.headers.get("X-Payment")
+    payment_header = request.headers.get("x-payment") or request.headers.get("X-Payment") or request.query_params.get("token")
 
     if not payment_header:
         # Return 402 Payment Required with payment details
@@ -179,6 +181,8 @@ async def run_swarm_simulation(
     num_agents: int,
     rounds: int,
     llm_client: AsyncOpenAI,
+    action_queue: Optional[asyncio.Queue] = None,
+    job_actions_list: Optional[List[Dict]] = None,
 ) -> Dict[str, Any]:
     """
     Lightweight MiroFish-style swarm simulation using LLM.
@@ -229,14 +233,27 @@ async def run_swarm_simulation(
         )
         simulation_tasks.append(task)
     
-    batch_results = await asyncio.gather(*simulation_tasks, return_exceptions=True)
-    
-    for result in batch_results:
-        if isinstance(result, Exception):
-            logger.warning(f"Batch simulation error: {result}")
-            continue
-        all_actions.extend(result.get("actions", []))
-        round_summaries.extend(result.get("round_summaries", []))
+    for coro in asyncio.as_completed(simulation_tasks):
+        try:
+            result = await coro
+            if isinstance(result, Exception):
+                logger.warning(f"Batch simulation error: {result}")
+                continue
+            
+            batch_actions = result.get("actions", [])
+            all_actions.extend(batch_actions)
+            round_summaries.extend(result.get("round_summaries", []))
+            
+            if job_actions_list is not None:
+                job_actions_list.extend(batch_actions)
+                
+            if action_queue:
+                for action in batch_actions:
+                    action_event = dict(action)
+                    action_event["type"] = "action"
+                    await action_queue.put(action_event)
+        except Exception as e:
+            logger.warning(f"Batch simulation error: {e}")
     
     # ── Phase 2.5: Compute interaction-based influence scores ────────────────
     # Count how many REPLY/AMPLIFY actions target each agent_id
@@ -623,6 +640,128 @@ async def predict(body: PredictRequest):
     except Exception as e:
         logger.error(f"[{prediction_id}] Prediction failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Simulation failed: {str(e)}")
+
+
+# ─── Streaming & Job Endpoints ───────────────────────────────────────────────
+
+def cleanup_old_jobs():
+    now = datetime.utcnow()
+    to_delete = []
+    for job_id, job_data in JOBS.items():
+        if (now - job_data["created_at"]).total_seconds() > 1800:
+            to_delete.append(job_id)
+    for job_id in to_delete:
+        del JOBS[job_id]
+
+
+async def run_background_simulation(job_id: str, body: PredictRequest):
+    queue = JOBS[job_id]["queue"]
+    try:
+        llm = get_llm_client()
+        result = await run_swarm_simulation(
+            seed_text=body.seed_text,
+            num_agents=body.num_agents,
+            rounds=body.rounds,
+            llm_client=llm,
+            action_queue=queue,
+            job_actions_list=JOBS[job_id]["actions"]
+        )
+        
+        full_result = {
+            "prediction_id": job_id,
+            "seed_text": body.seed_text,
+            "num_agents": body.num_agents,
+            "rounds": body.rounds,
+            **result
+        }
+        
+        JOBS[job_id]["status"] = "completed"
+        JOBS[job_id]["result"] = full_result
+        
+        complete_event = {
+            "type": "complete",
+            "sentiment_distribution": result.get("sentiment_distribution", {}),
+            "top_narratives": result.get("top_narratives", []),
+            "emerging_trends": result.get("emerging_trends", []),
+            "report": result.get("report", ""),
+            "duration_seconds": result.get("duration_seconds", 0.0),
+            "total_actions": result.get("total_actions", 0),
+            "prediction_id": job_id
+        }
+        await queue.put(complete_event)
+        
+    except Exception as e:
+        logger.error(f"[{job_id}] Background simulation failed: {e}", exc_info=True)
+        JOBS[job_id]["status"] = "failed"
+        await queue.put({"type": "error", "message": f"Simulation failed: {str(e)}"})
+
+
+@app.post("/api/predict/start")
+async def predict_start(body: PredictRequest, background_tasks: BackgroundTasks):
+    """
+    Start a background swarm intelligence simulation.
+    Returns immediately with a job ID.
+    """
+    cleanup_old_jobs()
+    if len(JOBS) >= MAX_CONCURRENT_JOBS:
+        raise HTTPException(status_code=429, detail="Too many concurrent jobs")
+        
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {
+        "status": "running",
+        "actions": [],
+        "result": None,
+        "queue": asyncio.Queue(),
+        "created_at": datetime.utcnow()
+    }
+    
+    background_tasks.add_task(run_background_simulation, job_id, body)
+    
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "num_agents": body.num_agents,
+        "rounds": body.rounds
+    }
+
+
+async def event_streamer(job_id: str):
+    queue = JOBS[job_id]["queue"]
+    while True:
+        try:
+            event = await asyncio.wait_for(queue.get(), timeout=5.0)
+            yield f"data: {json.dumps(event)}\n\n"
+            if event["type"] in ("complete", "error"):
+                break
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+
+
+@app.get("/api/predict/{job_id}/stream")
+async def predict_stream(job_id: str):
+    """
+    SSE stream of agent actions as they are generated.
+    """
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return StreamingResponse(event_streamer(job_id), media_type="text/event-stream")
+
+
+@app.get("/api/predict/{job_id}")
+async def predict_status(job_id: str):
+    """
+    Check status of a prediction job.
+    """
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = JOBS[job_id]
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "actions_so_far": job["actions"],
+        "result": job["result"]
+    }
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
